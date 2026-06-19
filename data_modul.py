@@ -50,10 +50,10 @@ class NDataset(Dataset):
         model = (model.astype(np.float32))
         data = (data.astype(np.float32))
 
-        # height_data = np.load(height_path)
-        # height = height_data.astype(np.float32)
+        height_data = np.load(height_path)
+        height = height_data.astype(np.float32)
 
-        return {'model': model, 'data': data, 'height': 1}
+        return {'model': model, 'data': data, 'height': height}
 
 
 class DataModule(L.LightningDataModule):

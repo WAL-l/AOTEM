@@ -1,2 +1,58 @@
 # AOTEM
 The repository for AOTEM: An Efficient Adaptive Octree Embedding Solver for Airborne Transient Electromagnetic Response
+
+# Train
+
+## Installation
+run:
+```
+pip install -r requirements.txt
+```
+## Training models
+
+### Preparing Data
+
+The training code reads ‘npy’ data from a directory of data files. 
+
+```
+data_dir
+│       
+└───train
+│   │
+│   └───data_type1
+│       │   
+│       └───data
+│       │   │   file021.npy
+│       │
+│       └───mdoel  
+│       │   │   file021.npy
+│       │
+│       └───height  
+│           │   file021.npy
+└───val
+    │
+    └───data_type1
+        │   
+        └───data
+        │   │   file031.npy
+        │
+        └───mdoel  
+        │   │   file031.npy
+        │
+        └───height  
+            │   file031.npy
+``` 
+
+Specify 'train_dir' and 'val_dir' inside main DataModule.
+
+## training
+```
+python main.py
+```
+You may also want to train in a distributed manner. In this case, Specify 'accelerator' and 'devices' in the 'Trainer'.
+
+The logs and saved models will be written to a logging directory determined by the 'dirpath' in main.
+
+
+
+

@@ -19,7 +19,7 @@ def train():
     net = Net()
     # accumulator = GradientAccumulationScheduler(scheduling={0: 8, 4: 4, 8: 1})
     # TODO 更改Checkpoint保存策略
-    checkpoint_callback = ModelCheckpoint(dirpath="./gptest",
+    checkpoint_callback = ModelCheckpoint(dirpath="./test",
                                           save_top_k=2,
                                           monitor="val_loss",
                                           save_last=False,
@@ -38,7 +38,7 @@ def train():
         gradient_clip_val=0.5,
         gradient_clip_algorithm="norm",
         max_epochs=500,
-        default_root_dir="./gptest",
+        default_root_dir="./test",
         check_val_every_n_epoch=10)
 
     trainer.fit(model=net, datamodule=data)

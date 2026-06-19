@@ -4,13 +4,17 @@
 # @Author  : Ws
 # @File    : model.py
 # @Software: PyCharm
+import math
+
 import torch
 import torch.nn as nn
 from timm.models.vision_transformer import Attention, Mlp
 from monai.utils import optional_import
 import torch.nn.functional as F
 import numpy as np
+
 rearrange, _ = optional_import("einops", name="rearrange")
+
 
 @torch.no_grad()
 def generate_octree_masks(V, s, D_m, H_m, W_m):
@@ -30,7 +34,7 @@ def generate_octree_masks(V, s, D_m, H_m, W_m):
 
     # Step 1: Get volume dimensions
     _, _, D, H, W = V.shape
-    
+
     # Step 2: Determine the scale level `l`
     l_d = max(int(np.log2(D / D_m)), 0) if D_m > 0 else 0
     l_h = max(int(np.log2(H / H_m)), 0) if H_m > 0 else 0
@@ -55,58 +59,62 @@ def generate_octree_masks(V, s, D_m, H_m, W_m):
     return M
 
 
+def modulate(x, shift, scale):
+    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
 class AdaptiveBlockEmbedding(nn.Module):
     def __init__(self, in_channels=1, hidden_size=384, patch_size=4):
         super().__init__()
         self.patch_size = patch_size
         self.hidden_size = hidden_size
-        
+
         # Patch embedding: 将每个patch投影到hidden_size维度
         self.patch_embed = nn.Conv3d(
-            in_channels, 
-            hidden_size, 
-            kernel_size=patch_size, 
+            in_channels,
+            hidden_size,
+            kernel_size=patch_size,
             stride=patch_size
         )
-        
+
         # 用于合并块的embedding（处理2x2x2或更大的合并块）
         self.merged_patch_embed = nn.Sequential(
             nn.Conv3d(in_channels, hidden_size // 2, kernel_size=patch_size * 2, stride=patch_size * 2),
             nn.GELU(),
             nn.Conv3d(hidden_size // 2, hidden_size, kernel_size=1)
         )
-        
+
         # 位置编码
         self.pos_embed = None
-        
+
     def compute_num_patches(self, D, H, W):
         return D // self.patch_size, H // self.patch_size, W // self.patch_size
-    
+
     def get_positional_encoding(self, num_patches, device):
         d_patches, h_patches, w_patches = num_patches
         total_patches = d_patches * h_patches * w_patches
-        
+
         if self.pos_embed is None or self.pos_embed.shape[1] != total_patches:
             # 使用正弦位置编码
             pos = torch.arange(total_patches, device=device).unsqueeze(1)
             dim = torch.arange(self.hidden_size, device=device).unsqueeze(0)
-            
+
             div_term = torch.exp(dim.float() * (-np.log(10000.0) / self.hidden_size))
             pos_encoding = torch.sin(pos * div_term)
-            
+
             self.pos_embed = pos_encoding.unsqueeze(0)  # [1, total_patches, hidden_size]
-        
+
         return self.pos_embed
-    
+
     def extract_patches(self, x):
         B, C, D, H, W = x.shape
         p = self.patch_size
-        
+
         # 计算每个维度的patch数量
         d_patches = D // p
         h_patches = H // p
         w_patches = W // p
-        
+
         # 重塑为patches
         # [B, C, D, H, W] -> [B, C, d_patches, p, h_patches, p, w_patches, p]
         x = x.view(B, C, d_patches, p, h_patches, p, w_patches, p)
@@ -114,9 +122,9 @@ class AdaptiveBlockEmbedding(nn.Module):
         x = x.permute(0, 2, 4, 6, 1, 3, 5, 7).contiguous()
         # [B, num_patches, C, p, p, p]
         x = x.view(B, d_patches * h_patches * w_patches, C, p, p, p)
-        
+
         return x
-    
+
     def forward(self, x, mask):
         B, C, D, H, W = x.shape
         _, D_m, H_m, W_m = mask.shape
@@ -127,8 +135,8 @@ class AdaptiveBlockEmbedding(nn.Module):
         num_patches_total = d_patches * h_patches * w_patches
 
         mask_resized = F.interpolate(
-            mask.unsqueeze(1), 
-            size=(d_patches, h_patches, w_patches), 
+            mask.unsqueeze(1),
+            size=(d_patches, h_patches, w_patches),
             mode='nearest'
         ).squeeze(1)  # [B, d_patches, h_patches, w_patches]
 
@@ -137,12 +145,12 @@ class AdaptiveBlockEmbedding(nn.Module):
         mask_flat = mask_resized.reshape(B, -1)  # [B, num_patches_total]
 
         tokens_list = []
-        
+
         for b in range(B):
             batch_mask = mask_flat[b]  # [num_patches_total]
             change_indices = torch.where(batch_mask == 1)[0]
             smooth_indices = torch.where(batch_mask == 0)[0]
-            
+
             batch_tokens = []
 
             if len(change_indices) > 0:
@@ -158,19 +166,19 @@ class AdaptiveBlockEmbedding(nn.Module):
                 coords_hw = smooth_indices % (h_patches * w_patches)
                 coords_h = coords_hw // w_patches
                 coords_w = coords_hw % w_patches
-                
+
                 smooth_coords = torch.stack([coords_d, coords_h, coords_w], dim=1)  # [N_smooth, 3]
 
                 used = torch.zeros(len(smooth_coords), dtype=torch.bool, device=x.device)
-                
+
                 for i in range(len(smooth_coords)):
                     if used[i]:
                         continue
-                    
+
                     current_coord = smooth_coords[i]
 
                     neighbors = [i]
-                    
+
                     for j in range(i + 1, len(smooth_coords)):
                         if used[j]:
                             continue
@@ -186,7 +194,7 @@ class AdaptiveBlockEmbedding(nn.Module):
                         used[merge_group] = True
 
                         merge_coords = smooth_coords[merge_group]
-                        
+
                         # 计算合并区域的起始和结束位置
                         coord_min = merge_coords.min(dim=0)[0]
                         coord_max = merge_coords.max(dim=0)[0]
@@ -203,19 +211,19 @@ class AdaptiveBlockEmbedding(nn.Module):
                         else:
 
                             for idx in merge_group:
-                                single_patch = patches[b:b+1, smooth_indices[idx]:smooth_indices[idx]+1]
+                                single_patch = patches[b:b + 1, smooth_indices[idx]:smooth_indices[idx] + 1]
                                 single_patch = single_patch[0]
                                 single_token = self.patch_embed(single_patch)
                                 single_token = single_token.view(1, self.hidden_size)
                                 batch_tokens.append(single_token)
                     else:
 
-                        single_patch = patches[b:b+1, smooth_indices[i]:smooth_indices[i]+1]
+                        single_patch = patches[b:b + 1, smooth_indices[i]:smooth_indices[i] + 1]
                         single_patch = single_patch[0]
                         single_token = self.patch_embed(single_patch)
                         single_token = single_token.view(1, self.hidden_size)
                         batch_tokens.append(single_token)
-            
+
             if batch_tokens:
                 batch_tokens = torch.cat(batch_tokens, dim=0)  # [num_tokens, hidden_size]
                 tokens_list.append(batch_tokens)
@@ -226,7 +234,7 @@ class AdaptiveBlockEmbedding(nn.Module):
         max_tokens = max(t.shape[0] for t in tokens_list)
         tokens_padded = torch.zeros(B, max_tokens, self.hidden_size, device=x.device)
         mask_tokens = torch.zeros(B, max_tokens, device=x.device)
-        
+
         for b, tokens in enumerate(tokens_list):
             num_tokens = tokens.shape[0]
             tokens_padded[b, :num_tokens] = tokens
@@ -234,11 +242,33 @@ class AdaptiveBlockEmbedding(nn.Module):
 
         pos_embed = self.get_positional_encoding((d_patches, h_patches, w_patches), x.device)
         tokens_padded = tokens_padded + pos_embed[:, :max_tokens]
-        
+
         return tokens_padded, mask_tokens
 
 
 class Block(nn.Module):
+
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
+        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        approx_gelu = lambda: nn.GELU(approximate="tanh")
+        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+        )
+
+    def forward(self, x, c):
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
+        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        return x
+
+
+class Block_(nn.Module):
 
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
         super().__init__()
@@ -259,21 +289,48 @@ class Block(nn.Module):
     def forward(self, x, h):
         # x: [B, L, C], h: [B, L, C]
         gate_scores = torch.sigmoid(self.gate_proj(h))  # [B, L, num_heads]
-        
+
         attn_output = self.attn(self.norm1(x))  # [B, L, C]
-        
+
         B, L, D = attn_output.shape
         head_dim = D // self.num_heads
         attn_output_heads = attn_output.view(B, L, self.num_heads, head_dim)
-        
-        # 应用门控机制
+
         gated_attn = attn_output_heads * gate_scores.unsqueeze(-1).view(B, L, self.num_heads, 1)
         gated_attn = gated_attn.view(B, L, D)
-        
+
         x = x + gated_attn
         x = x + self.mlp(self.norm2(x))
-        
+
         return x
+
+
+class HEmbedder(nn.Module):
+    def __init__(self, hidden_size, frequency_embedding_size=256):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=True),
+        )
+        self.frequency_embedding_size = frequency_embedding_size
+
+    @staticmethod
+    def himestep_embedding(h, dim, max_period=10000):
+        half = dim // 2
+        freqs = torch.exp(
+            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
+        ).to(device=h.device)
+        args = h[:, None].float() * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+        return embedding
+
+    def forward(self, h):
+        h_freq = self.himestep_embedding(h, self.frequency_embedding_size)
+        h_emb = self.mlp(h_freq)
+        return h_emb
 
 
 class UNET(nn.Module):
@@ -297,12 +354,14 @@ class UNET(nn.Module):
         self.hidden_size = hidden_size
         self.patch_size = patch_size
         self.mask_threshold = mask_threshold
-        
+
         D, H, W = input_shape
         self.d_patches = D // patch_size
         self.h_patches = H // patch_size
         self.w_patches = W // patch_size
         self.num_patches_total = self.d_patches * self.h_patches * self.w_patches
+
+        self.h_embedder = HEmbedder(hidden_size)
 
         self.adaptive_embed = AdaptiveBlockEmbedding(
             in_channels=in_channels,
@@ -327,7 +386,7 @@ class UNET(nn.Module):
             kernel_size=patch_size,
             stride=patch_size
         )
-        
+
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -338,14 +397,14 @@ class UNET(nn.Module):
         nn.init.xavier_uniform_(self.output_proj[1].weight)
         nn.init.xavier_uniform_(self.output_proj[3].weight)
 
-    def forward(self, x):
+    def forward(self, x, h):
 
         B, C, D, H, W = x.shape
-        
+
         # Step 1: 生成八叉树掩码
         with torch.no_grad():
             mask = generate_octree_masks(
-                x, 
+                x,
                 s=self.mask_threshold,
                 D_m=self.d_patches,
                 H_m=self.h_patches,
@@ -353,9 +412,8 @@ class UNET(nn.Module):
             )
 
         tokens, token_mask = self.adaptive_embed(x, mask)  # [B, num_tokens, hidden_size]
-        
-        # Step 3: Transformer处理
-        h = tokens
+        h = self.h_embedder(h)
+
         for block in self.blocks:
             tokens = block(tokens, h)
 
@@ -368,7 +426,7 @@ class UNET(nn.Module):
             # [B, d_patches*h_patches*w_patches, C, p, p, p]
             # -> [B, C, d_patches, h_patches, w_patches, p, p, p]
             patches_grid = patches_reshaped.view(
-                B, self.d_patches, self.h_patches, self.w_patches, 
+                B, self.d_patches, self.h_patches, self.w_patches,
                 self.out_channels, p, p, p
             )
             # -> [B, C, d_patches*p, h_patches*p, w_patches*p]
@@ -379,63 +437,3 @@ class UNET(nn.Module):
             output = torch.zeros(B, self.out_channels, D, H, W, device=x.device)
 
         return output
-
-
-if __name__ == "__main__":
-    print("=" * 70)
-    print("测试自适应Mask UNET模型")
-    print("=" * 70)
-    
-    # 创建模型
-    model = UNET(
-        in_channels=1,
-        out_channels=1,
-        input_shape=(64, 64, 32),
-        hidden_size=384,
-        depth=12,
-        num_heads=6,
-        patch_size=2,
-        mask_threshold=0
-    )
-    
-    print(f"\n模型结构:")
-    print(model)
-    
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"\n总参数量: {total_params:,}")
-    print(f"可训练参数量: {trainable_params:,}")
-    
-    # 创建测试数据
-    batch_size = 1
-    D, H, W = 64, 64, 32
-    x = torch.randn(batch_size, 1, D, H, W)
-    
-    print(f"\n输入形状: {x.shape}")
-    print(f"期望输出形状: ({batch_size}, 1, {D}, {H}, {W})")
-    
-    try:
-        with torch.no_grad():
-            output = model(x)
-        print(f"\n实际输出形状: {output.shape}")
-        
-        if output.shape == (batch_size, 1, D, H, W):
-            print("\n✓ 模型前向传播成功！输出形状符合预期。")
-        else:
-            print(f"\n⚠ 输出形状不符合预期！")
-        
-        print(f"\n输出统计:")
-        print(f"  均值: {output.mean().item():.6f}")
-        print(f"  标准差: {output.std().item():.6f}")
-        print(f"  最小值: {output.min().item():.6f}")
-        print(f"  最大值: {output.max().item():.6f}")
-        
-    except Exception as e:
-        print(f"\n✗ 模型前向传播失败！")
-        print(f"错误信息: {str(e)}")
-        import traceback
-        traceback.print_exc()
-    
-    print("\n" + "=" * 70)
-    print("测试完成")
-    print("=" * 70)
