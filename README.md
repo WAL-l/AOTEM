@@ -53,6 +53,11 @@ You may also want to train in a distributed manner. In this case, Specify 'accel
 
 The logs and saved models will be written to a logging directory determined by the 'dirpath' in main.
 
+## Test
+```bash
+python test.py
+```
+Note that you should specify 'checkpoint' and 'model_data' in the 'test'.
 
 
 
